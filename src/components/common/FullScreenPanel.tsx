@@ -27,6 +27,25 @@ interface FullScreenPanelProps {
 
 const DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px - match App.tsx
 const HEADER_HEIGHT = 64; // px - match App.tsx
+let bodyScrollLockCount = 0;
+let bodyOverflowBeforeLock = "";
+let nextPanelId = 0;
+const openPanelStack: number[] = [];
+
+function lockBodyScroll() {
+  if (bodyScrollLockCount === 0) {
+    bodyOverflowBeforeLock = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  bodyScrollLockCount += 1;
+}
+
+function unlockBodyScroll() {
+  bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+  if (bodyScrollLockCount === 0) {
+    document.body.style.overflow = bodyOverflowBeforeLock;
+  }
+}
 
 /**
  * Reusable full-screen panel component
@@ -41,12 +60,25 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
   footer,
   contentClassName,
 }) => {
+  const panelIdRef = React.useRef<number | null>(null);
+  if (panelIdRef.current === null) {
+    nextPanelId += 1;
+    panelIdRef.current = nextPanelId;
+  }
+
   React.useEffect(() => {
-    if (isOpen) {
-      document.body.style.overflow = "hidden";
-    }
+    if (!isOpen) return;
+    lockBodyScroll();
+    return unlockBodyScroll;
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const panelId = panelIdRef.current as number;
+    openPanelStack.push(panelId);
     return () => {
-      document.body.style.overflow = "";
+      const index = openPanelStack.lastIndexOf(panelId);
+      if (index >= 0) openPanelStack.splice(index, 1);
     };
   }, [isOpen]);
 
@@ -61,6 +93,9 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
     if (!isOpen) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (openPanelStack.at(-1) !== panelIdRef.current) {
+        return;
+      }
       if (event.key === "Escape") {
         // 子组件（例如 Radix 的 Select/Dialog/Dropdown）如果已经消费了 ESC，就不要再关闭整个面板
         if (event.defaultPrevented) {
@@ -71,7 +106,8 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
           return; // 让输入框自己处理 ESC（比如清空、失焦等）
         }
 
-        event.stopPropagation(); // 阻止事件继续冒泡到 window，避免触发 App.tsx 的全局监听
+        event.preventDefault();
+        event.stopImmediatePropagation();
         onCloseRef.current();
       }
     };

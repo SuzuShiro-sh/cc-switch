@@ -40,6 +40,15 @@ export interface InstalledSkill {
   updatedAt: number;
 }
 
+/** 用户定义的 Skill 分组。配置方案保存展开后的 Skill ID。 */
+export interface SkillGroup {
+  id: string;
+  name: string;
+  skillIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface SkillUninstallResult {
   backupPath?: string;
 }
@@ -141,6 +150,35 @@ export const skillsApi = {
   /** 获取所有已安装的 Skills */
   async getInstalled(): Promise<InstalledSkill[]> {
     return await invoke("get_installed_skills");
+  },
+
+  /** 获取全部 Skill 分组 */
+  async getGroups(): Promise<SkillGroup[]> {
+    return await invoke("get_skill_groups");
+  },
+
+  /** 创建 Skill 分组 */
+  async createGroup(name: string, skillIds: string[]): Promise<SkillGroup> {
+    return await invoke("create_skill_group", { name, skillIds });
+  },
+
+  /** 更新 Skill 分组 */
+  async updateGroup(
+    id: string,
+    name: string,
+    skillIds: string[],
+  ): Promise<SkillGroup> {
+    return await invoke("update_skill_group", { id, name, skillIds });
+  },
+
+  /** 删除 Skill 分组，不删除其中的 Skill */
+  async deleteGroup(id: string): Promise<boolean> {
+    return await invoke("delete_skill_group", { id });
+  },
+
+  /** 在系统文件管理器中打开 Skill 目录 */
+  async openFolder(id: string): Promise<boolean> {
+    return await invoke("open_skill_folder", { id });
   },
 
   /** 获取可恢复的 Skill 备份列表 */

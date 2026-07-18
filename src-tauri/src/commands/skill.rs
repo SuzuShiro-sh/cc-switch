@@ -4,20 +4,37 @@
 //! - 支持三应用开关（Claude/Codex/Gemini）
 //! - SSOT 存储在 ~/.cc-switch/skills/
 
-use crate::app_config::{AppType, InstalledSkill, UnmanagedSkill};
+use crate::app_config::{AppType, InstalledSkill, SkillGroup, UnmanagedSkill};
 use crate::error::format_skill_error;
 use crate::services::skill::{
     DiscoverableSkill, ImportSkillSelection, MigrationResult, Skill, SkillBackupEntry, SkillRepo,
     SkillService, SkillStorageLocation, SkillUninstallResult, SkillUpdateInfo,
     SkillsShSearchResult,
 };
+use crate::services::SkillGroupService;
 use crate::store::AppState;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
 
 /// SkillService 状态包装
 pub struct SkillServiceState(pub Arc<SkillService>);
+
+fn resolve_managed_skill_folder(root: &Path, directory: &str) -> Result<PathBuf, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("解析 Skills 根目录失败: {e}"))?;
+    let path = root.join(directory);
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("解析 Skill 目录失败: {e}"))?;
+    if !path.is_dir() || !path.starts_with(&root) {
+        return Err(format!("Skill 目录不在受管范围内: {directory}"));
+    }
+    Ok(path)
+}
 
 /// 解析 app 参数为 AppType
 fn parse_app_type(app: &str) -> Result<AppType, String> {
@@ -30,6 +47,62 @@ fn parse_app_type(app: &str) -> Result<AppType, String> {
 #[tauri::command]
 pub fn get_installed_skills(app_state: State<'_, AppState>) -> Result<Vec<InstalledSkill>, String> {
     SkillService::get_all_installed(&app_state.db).map_err(|e| e.to_string())
+}
+
+/// 获取全部用户定义的 Skill 分组。
+#[tauri::command]
+pub fn get_skill_groups(app_state: State<'_, AppState>) -> Result<Vec<SkillGroup>, String> {
+    SkillGroupService::list(&app_state.db).map_err(|e| e.to_string())
+}
+
+/// 创建 Skill 分组。
+#[tauri::command]
+pub fn create_skill_group(
+    name: String,
+    skill_ids: Vec<String>,
+    app_state: State<'_, AppState>,
+) -> Result<SkillGroup, String> {
+    SkillGroupService::create(&app_state.db, &name, skill_ids).map_err(|e| e.to_string())
+}
+
+/// 更新 Skill 分组并原子替换成员。
+#[tauri::command]
+pub fn update_skill_group(
+    id: String,
+    name: String,
+    skill_ids: Vec<String>,
+    app_state: State<'_, AppState>,
+) -> Result<SkillGroup, String> {
+    SkillGroupService::update(&app_state.db, &id, &name, skill_ids).map_err(|e| e.to_string())
+}
+
+/// 删除 Skill 分组，不删除其中的 Skill。
+#[tauri::command]
+pub fn delete_skill_group(id: String, app_state: State<'_, AppState>) -> Result<bool, String> {
+    SkillGroupService::delete(&app_state.db, &id).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// 在系统文件管理器中打开受管 Skill 目录。
+#[tauri::command]
+pub fn open_skill_folder(
+    id: String,
+    handle: AppHandle,
+    app_state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let skill = app_state
+        .db
+        .get_installed_skill(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Skill not found: {id}"))?;
+    let root = SkillService::get_ssot_dir().map_err(|e| e.to_string())?;
+    let path = resolve_managed_skill_folder(&root, &skill.directory)?;
+
+    handle
+        .opener()
+        .open_path(path.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| format!("打开 Skill 目录失败: {e}"))?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -333,4 +406,25 @@ pub fn install_skills_from_zip(
     let path = std::path::Path::new(&file_path);
 
     SkillService::install_from_zip(&app_state.db, path, &app_type).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_managed_skill_folder;
+
+    #[test]
+    fn managed_skill_folder_rejects_paths_outside_root() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("skills");
+        let inside = root.join("research");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&inside).expect("create managed Skill dir");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+
+        assert_eq!(
+            resolve_managed_skill_folder(&root, "research").expect("resolve managed folder"),
+            inside.canonicalize().expect("canonical managed folder")
+        );
+        assert!(resolve_managed_skill_folder(&root, "../outside").is_err());
+    }
 }

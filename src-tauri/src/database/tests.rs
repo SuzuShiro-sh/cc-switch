@@ -216,6 +216,132 @@ fn schema_migration_rejects_future_version() {
 }
 
 #[test]
+fn schema_migration_v16_adds_skill_groups_with_cascading_members() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE skills (id TEXT PRIMARY KEY);
+        INSERT INTO skills (id) VALUES ('s1');
+        "#,
+    )
+    .expect("seed v16 skills");
+    Database::set_user_version(&conn, 16).expect("set user_version=16");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+    let skills_foreign_key_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('skill_group_members')
+             WHERE \"table\" = 'skills'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read member foreign keys");
+    assert_eq!(skills_foreign_key_count, 1);
+    conn.execute(
+        "INSERT INTO skill_groups (id, name, created_at, updated_at)
+         VALUES ('g1', 'Research', 1, 1)",
+        [],
+    )
+    .expect("insert group");
+    conn.execute(
+        "INSERT INTO skill_group_members (group_id, skill_id, sort_order)
+         VALUES ('g1', 's1', 0)",
+        [],
+    )
+    .expect("insert member");
+    conn.execute("DELETE FROM skills WHERE id = 's1'", [])
+        .expect("delete skill");
+    let member_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM skill_group_members", [], |row| {
+            row.get(0)
+        })
+        .expect("count members");
+    assert_eq!(member_count, 0);
+}
+
+#[test]
+fn schema_migration_from_fork_v13_preserves_groups_and_repairs_official_columns() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE skills (id TEXT PRIMARY KEY);
+        CREATE TABLE mcp_servers (id TEXT PRIMARY KEY);
+        CREATE TABLE proxy_config (app_type TEXT PRIMARY KEY);
+        CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY);
+        CREATE TABLE usage_daily_rollups (id INTEGER PRIMARY KEY);
+        CREATE TABLE skill_groups (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE skill_group_members (
+            group_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (group_id, skill_id),
+            FOREIGN KEY (group_id) REFERENCES skill_groups(id) ON DELETE CASCADE,
+            FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+        );
+        INSERT INTO skills (id) VALUES ('s1');
+        INSERT INTO skill_groups (id, name, created_at, updated_at)
+        VALUES ('g1', 'Research', 1, 1);
+        INSERT INTO skill_group_members (group_id, skill_id, sort_order)
+        VALUES ('g1', 's1', 7);
+        "#,
+    )
+    .expect("seed fork schema v13");
+    Database::set_user_version(&conn, 13).expect("set user_version=13");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+    assert!(
+        Database::has_column(&conn, "proxy_request_logs", "input_token_semantics")
+            .expect("check request semantics column")
+    );
+    assert!(
+        Database::has_column(&conn, "usage_daily_rollups", "input_token_semantics")
+            .expect("check rollup semantics column")
+    );
+    assert!(Database::has_column(&conn, "skills", "enabled_grokbuild")
+        .expect("check Grok Build Skill column"));
+    assert!(
+        Database::has_column(&conn, "mcp_servers", "enabled_grokbuild")
+            .expect("check Grok Build MCP column")
+    );
+
+    let preserved_member: (String, String, i64) = conn
+        .query_row(
+            "SELECT group_id, skill_id, sort_order FROM skill_group_members",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read preserved Skill group member");
+    assert_eq!(preserved_member, ("g1".to_string(), "s1".to_string(), 7));
+
+    let skills_foreign_key_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('skill_group_members')
+             WHERE \"table\" = 'skills'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read repaired member foreign key");
+    assert_eq!(skills_foreign_key_count, 1);
+}
+
+#[test]
 fn schema_migration_adds_missing_columns_for_providers() {
     let conn = Connection::open_in_memory().expect("open memory db");
 

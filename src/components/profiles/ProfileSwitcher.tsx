@@ -40,14 +40,11 @@ import {
   useProfilesQuery,
 } from "@/lib/query/profiles";
 import { ProfileManageDialog } from "./ProfileManageDialog";
-import { APP_PROFILE_SCOPE, hasScopeSnapshot } from "./scope";
-import type { CurrentProfileIds, ProfileScope } from "@/lib/api/profiles";
-
-const CURRENT_ID_KEY: Record<ProfileScope, keyof CurrentProfileIds> = {
-  claude: "claude",
-  "claude-desktop": "claudeDesktop",
-  codex: "codex",
-};
+import {
+  APP_PROFILE_SCOPE,
+  isProfileAvailableForScope,
+  PROFILE_CURRENT_ID_KEY,
+} from "./scope";
 
 interface ProfileSwitcherProps {
   activeApp: AppId;
@@ -56,10 +53,8 @@ interface ProfileSwitcherProps {
 /**
  * 项目 Profile 切换器（header 左侧入口）
  *
- * 项目列表全应用共享（用户拥有的项目就那几个），但切换按分组进行：
- * Claude 组（Claude Code 的供应商/MCP/Skills/记忆文件 + Claude Desktop
- * 的供应商）与 Codex 组各自指向自己的当前项目、只应用组内快照。
- * 与右侧 AppSwitcher（仅切换查看的应用）语义不同。
+ * 只展示 targets 包含当前 Agent 的方案。选择任一方案时按其 targets 整体
+ * 应用，因此一个方案可以同时切换 Claude、Codex、Gemini，也可以只绑定一个。
  */
 export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
   const { t } = useTranslation();
@@ -81,14 +76,16 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
   }
 
   const profiles = data?.profiles ?? [];
-  const currentId = data?.currentIds?.[CURRENT_ID_KEY[scope]] ?? null;
+  const visibleProfiles = profiles.filter((profile) =>
+    isProfileAvailableForScope(profile, scope),
+  );
+  const currentId = data?.currentIds?.[PROFILE_CURRENT_ID_KEY[scope]] ?? null;
   const currentProfile = profiles.find((p) => p.id === currentId);
 
   const handleApply = (id: string) => {
+    if (applyMutation.isPending) return;
     setOpen(false);
-    if (id !== currentId) {
-      applyMutation.mutate({ id, scope });
-    }
+    applyMutation.mutate({ id });
   };
 
   const closeCreateDialog = () => {
@@ -110,6 +107,7 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
             type="button"
             role="combobox"
             aria-expanded={open}
+            disabled={applyMutation.isPending}
             title={t(`profiles.switcherTooltip.${scope}`)}
             className={cn(
               "inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-sm font-medium transition-colors",
@@ -134,13 +132,14 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
             <CommandInput placeholder={t("profiles.searchPlaceholder")} />
             <CommandList>
               <CommandEmpty>{t("profiles.empty")}</CommandEmpty>
-              {profiles.length > 0 && (
+              {visibleProfiles.length > 0 && (
                 <CommandGroup>
-                  {profiles.map((profile) => (
+                  {visibleProfiles.map((profile) => (
                     <CommandItem
                       key={profile.id}
                       value={profile.id}
                       keywords={[profile.name]}
+                      disabled={applyMutation.isPending}
                       onSelect={() => handleApply(profile.id)}
                     >
                       <Check
@@ -152,11 +151,6 @@ export function ProfileSwitcher({ activeApp }: ProfileSwitcherProps) {
                         )}
                       />
                       <span className="truncate">{profile.name}</span>
-                      {!hasScopeSnapshot(profile, scope) && (
-                        <span className="ml-auto shrink-0 pl-2 text-xs text-muted-foreground">
-                          {t("profiles.noSnapshotForScope")}
-                        </span>
-                      )}
                     </CommandItem>
                   ))}
                 </CommandGroup>

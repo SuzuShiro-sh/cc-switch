@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { profilesApi, providersApi } from "@/lib/api";
-import type { ProfileScope } from "@/lib/api/profiles";
+import type { ProfilePayload, ProfileScope } from "@/lib/api/profiles";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 const updateTrayMenuSafely = async () => {
@@ -49,18 +49,19 @@ export const useUpdateProfileMutation = () => {
     mutationFn: ({
       id,
       name,
-      resnapshot,
-      scope,
+      payload,
     }: {
       id: string;
       name?: string;
-      resnapshot?: boolean;
-      scope?: ProfileScope;
-    }) => profilesApi.update(id, { name, resnapshot, scope }),
-    onSuccess: async () => {
+      payload?: ProfilePayload;
+      silent?: boolean;
+    }) => profilesApi.update(id, { name, payload }),
+    onSuccess: async (_profile, variables) => {
       await queryClient.invalidateQueries({ queryKey: ["profiles"] });
       await updateTrayMenuSafely();
-      toast.success(t("profiles.updateSuccess"), { closeButton: true });
+      if (!variables.silent) {
+        toast.success(t("profiles.updateSuccess"), { closeButton: true });
+      }
     },
     onError: (error: Error) => {
       const detail = extractErrorMessage(error) || t("common.unknown");
@@ -116,9 +117,9 @@ export const useApplyProfileMutation = () => {
   const { t } = useTranslation();
 
   return useMutation({
-    mutationFn: ({ id, scope }: { id: string; scope: ProfileScope }) =>
-      profilesApi.apply(id, scope),
-    onSuccess: async (warnings) => {
+    mutationFn: ({ id }: { id: string; silent?: boolean }) =>
+      profilesApi.apply(id),
+    onSuccess: async (warnings, variables) => {
       await queryClient.invalidateQueries({ queryKey: ["profiles"] });
       await queryClient.invalidateQueries({
         queryKey: ["providers", "claude"],
@@ -127,10 +128,24 @@ export const useApplyProfileMutation = () => {
         queryKey: ["providers", "claude-desktop"],
       });
       await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["providers", "gemini"],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["configSets"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["proxyTakeoverStatus"],
+      });
+      await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
       await queryClient.invalidateQueries({ queryKey: ["mcp", "all"] });
       await queryClient.invalidateQueries({ queryKey: ["skills"] });
+      await queryClient.invalidateQueries({
+        queryKey: ["skills", "installed"],
+      });
       await updateTrayMenuSafely();
 
+      if (variables.silent) {
+        return;
+      }
       if (warnings.length > 0) {
         toast.warning(
           t("profiles.applyWarnings", {

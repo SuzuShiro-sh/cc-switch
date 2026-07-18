@@ -7,8 +7,9 @@ use std::fs;
 use serde_json::json;
 
 use cc_switch_lib::{
-    AppType, InstalledSkill, McpServer, McpService, ProfilePayload, ProfileScope, ProfileService,
-    Prompt, PromptService, Provider, ProviderService, SkillApps, SkillService,
+    AppType, InstalledSkill, McpServer, McpService, ProfileApplyResult, ProfilePayload,
+    ProfileScope, ProfileService, Prompt, PromptService, Provider, ProviderService, SkillApps,
+    SkillService,
 };
 
 #[path = "support.rs"]
@@ -27,6 +28,31 @@ fn claude_provider(id: &str, token: &str) -> Provider {
         }),
         None,
     )
+}
+
+/// 构造可切换、可被本地路由接管的 Grok Build 测试供应商。
+fn grokbuild_provider(id: &str, endpoint: &str, api_key: &str) -> Provider {
+    let config = format!(
+        r#"[models]
+default = "grok-4.5"
+
+[model."grok-4.5"]
+model = "grok-4.5"
+base_url = "{endpoint}"
+name = "{id}"
+api_key = "{api_key}"
+api_backend = "responses"
+context_window = 500000
+"#
+    );
+    let mut provider = Provider::with_id(
+        id.to_string(),
+        id.to_uppercase(),
+        json!({ "config": config }),
+        None,
+    );
+    provider.category = Some("custom".to_string());
+    provider
 }
 
 /// Claude Desktop 供应商：无 meta 时默认 Direct 模式，只要求 env 里有 token + base_url
@@ -52,6 +78,17 @@ fn mcp_server(id: &str, claude_enabled: bool) -> McpServer {
         "apps": { "claude": claude_enabled }
     }))
     .expect("construct mcp server")
+}
+
+/// 构造仅对 Grok Build 启用的 MCP 测试服务。
+fn grokbuild_mcp_server(id: &str, enabled: bool) -> McpServer {
+    serde_json::from_value(json!({
+        "id": id,
+        "name": id,
+        "server": { "command": "echo", "args": [] },
+        "apps": { "grokbuild": enabled }
+    }))
+    .expect("construct Grok Build MCP server")
 }
 
 fn prompt(id: &str, enabled: bool) -> Prompt {
@@ -86,6 +123,13 @@ fn installed_skill(id: &str, directory: &str, claude_enabled: bool) -> Installed
     }
 }
 
+/// 构造仅对 Grok Build 启用的本地 Skill。
+fn installed_grokbuild_skill(id: &str, directory: &str) -> InstalledSkill {
+    let mut skill = installed_skill(id, directory, false);
+    skill.apps.grokbuild = true;
+    skill
+}
+
 fn write_ssot_skill(directory: &str) {
     let dir = SkillService::get_ssot_dir()
         .expect("resolve skills SSOT dir")
@@ -96,6 +140,38 @@ fn write_ssot_skill(directory: &str) {
         format!("---\nname: {directory}\ndescription: Test skill\n---\n"),
     )
     .expect("write SKILL.md");
+}
+
+/// 走完整 Profile 应用链：同步写基础配置，再在 Tokio 运行时中收敛路由状态。
+fn apply_profile(state: &cc_switch_lib::AppState, profile_id: &str) -> ProfileApplyResult {
+    let rt = tokio::runtime::Runtime::new().expect("create routing runtime");
+    apply_profile_with_runtime(state, profile_id, &rt)
+}
+
+fn apply_profile_with_runtime(
+    state: &cc_switch_lib::AppState,
+    profile_id: &str,
+    rt: &tokio::runtime::Runtime,
+) -> ProfileApplyResult {
+    let mut result = ProfileService::apply(state, profile_id).expect("apply profile config");
+    rt.block_on(ProfileService::finalize_routing(
+        state,
+        &result.routing_targets,
+        &mut result.warnings,
+    ));
+    result
+}
+
+fn use_ephemeral_proxy_port(state: &cc_switch_lib::AppState) {
+    futures::executor::block_on(async {
+        let mut proxy_config = state.db.get_proxy_config().await.expect("get proxy config");
+        proxy_config.listen_port = 0;
+        state
+            .db
+            .update_proxy_config(proxy_config)
+            .await
+            .expect("set ephemeral proxy port");
+    });
 }
 
 #[test]
@@ -208,9 +284,12 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
     PromptService::enable_prompt(&state, AppType::Claude, "pr2").expect("enable pr2");
 
     // ---- 应用项目 A（Claude 组）：只复原 Claude 侧 ----
-    let (warnings, _) = ProfileService::apply(&state, &profile_a.id, ProfileScope::Claude)
-        .expect("apply profile A");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let result = apply_profile(&state, &profile_a.id);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
 
     let current = state
         .db
@@ -279,18 +358,23 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
 }
 
 #[test]
-fn shared_profile_sides_are_isolated_and_mergeable() {
+fn multi_agent_profile_applies_all_targets_as_one_bundle() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     let home = ensure_test_home();
 
     let state = create_test_state().expect("create test state");
+    use_ephemeral_proxy_port(&state);
 
     // 种子：Claude 侧有当前供应商 + 启用的 MCP
     state
         .db
         .save_provider(AppType::Claude.as_str(), &claude_provider("p1", "key-1"))
         .expect("save provider p1");
+    state
+        .db
+        .save_provider(AppType::Claude.as_str(), &claude_provider("p2", "key-2"))
+        .expect("save provider p2");
     state
         .db
         .set_current_provider(AppType::Claude.as_str(), "p1")
@@ -308,10 +392,10 @@ fn shared_profile_sides_are_isolated_and_mergeable() {
         .save_mcp_server(&mcp_server("m1", true))
         .expect("save mcp m1");
 
-    // 在 Codex 页新建项目：快照不应捕获 Claude 侧的任何状态
+    // 在 Codex 页新建项目，默认只绑定 Codex。
     let project = ProfileService::create(&state, "Shared Project", ProfileScope::Codex)
         .expect("create project from codex tab");
-    let payload: ProfilePayload =
+    let mut payload: ProfilePayload =
         serde_json::from_str(&project.payload).expect("parse project payload");
     assert_eq!(
         payload.providers.claude, None,
@@ -320,25 +404,62 @@ fn shared_profile_sides_are_isolated_and_mergeable() {
     assert_eq!(payload.mcp.claude, None);
     assert_eq!(payload.providers.claude_desktop, None);
     assert_eq!(payload.mcp.codex, Some(vec![]), "codex side captured");
+    assert_eq!(payload.targets, vec![ProfileScope::Codex]);
 
-    // 按 Codex 组应用：只动 codex 组的 current 标记，Claude 侧原样不动
-    let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::Codex)
-        .expect("apply project on codex side");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    // 在可视化编辑器中把 Claude 加入捆绑包并显式保存其配置。
+    payload.targets = vec![ProfileScope::Claude, ProfileScope::Codex];
+    payload.providers.claude = Some("p1".to_string());
+    payload.mcp.claude = Some(vec!["m1".to_string()]);
+    let routing = payload.routing.as_mut().expect("new profile routing state");
+    routing.claude = Some(true);
+    routing.codex = Some(false);
+    ProfileService::update(&state, &project.id, None, Some(payload))
+        .expect("save multi-agent profile payload");
 
+    // 先制造 Claude 运行态偏移，再从任一 Agent 入口整体应用该方案。
+    ProviderService::switch(&state, AppType::Claude, "p2").expect("switch to p2");
+    McpService::toggle_app(&state, "m1", AppType::Claude, false).expect("disable m1");
+
+    let rt = tokio::runtime::Runtime::new().expect("create routing runtime");
+    let result = apply_profile_with_runtime(&state, &project.id, &rt);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
+    assert_eq!(
+        result.target_scopes,
+        vec![ProfileScope::Claude, ProfileScope::Codex]
+    );
+    assert_eq!(result.routing_targets.len(), 2);
+    assert!(result
+        .routing_targets
+        .iter()
+        .any(|target| target.app == AppType::Claude && target.enabled));
+    assert!(result
+        .routing_targets
+        .iter()
+        .any(|target| target.app == AppType::Codex && !target.enabled));
     assert_eq!(
         state
             .db
             .get_current_provider(AppType::Claude.as_str())
             .expect("get claude current provider")
             .as_deref(),
-        Some("p1"),
-        "claude provider untouched"
+        Some("p1")
     );
     let servers = state.db.get_all_mcp_servers().expect("get mcp servers");
     assert!(
         servers.get("m1").expect("m1").apps.claude,
-        "claude MCP untouched"
+        "Claude side restored by the bundle"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_current_profile_id("claude")
+            .expect("get claude current profile id")
+            .as_deref(),
+        Some(project.id.as_str())
     );
     assert_eq!(
         state
@@ -348,48 +469,168 @@ fn shared_profile_sides_are_isolated_and_mergeable() {
             .as_deref(),
         Some(project.id.as_str())
     );
-    assert_eq!(
-        state
-            .db
-            .get_current_profile_id("claude")
-            .expect("get claude current profile id"),
-        None,
-        "claude scope marker untouched by codex-side apply"
-    );
-
-    // 同一共享项目在 Claude 页应用：该侧未拍过快照 → 不动配置、标记 current、返回提示
-    let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::Claude)
-        .expect("apply project on claude side");
-    assert_eq!(warnings.len(), 1, "uncaptured side yields one hint");
-    assert!(warnings[0].contains("no claude configuration captured"));
-    let servers = state.db.get_all_mcp_servers().expect("get mcp servers");
     assert!(
-        servers.get("m1").expect("m1").apps.claude,
-        "claude MCP still untouched by uncaptured apply"
+        state.db.get_proxy_flags_sync("claude").0,
+        "Claude routing enabled by the bundle"
     );
+    assert!(
+        !state.db.get_proxy_flags_sync("codex").0,
+        "Codex routing disabled by the bundle"
+    );
+
+    rt.block_on(state.proxy_service.set_takeover_for_app("claude", false))
+        .expect("disable Claude routing after test");
+}
+
+/// 验证 Grok Build 配置方案可以完整恢复全部受管资源与路由状态。
+#[test]
+fn grokbuild_profile_roundtrip_restores_all_managed_resources() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let state = create_test_state().expect("create test state");
+    use_ephemeral_proxy_port(&state);
+
+    let provider_a = grokbuild_provider("grok-a", "https://grok-a.test/v1", "key-a");
+    let provider_b = grokbuild_provider("grok-b", "https://grok-b.test/v1", "key-b");
+    state
+        .db
+        .save_provider(AppType::GrokBuild.as_str(), &provider_a)
+        .expect("save Grok Build provider A");
+    state
+        .db
+        .save_provider(AppType::GrokBuild.as_str(), &provider_b)
+        .expect("save Grok Build provider B");
+    state
+        .db
+        .set_current_provider(AppType::GrokBuild.as_str(), "grok-a")
+        .expect("set current Grok Build provider A");
+
+    let grok_dir = home.join(".grok");
+    fs::create_dir_all(&grok_dir).expect("create Grok Build config directory");
+    fs::write(
+        grok_dir.join("config.toml"),
+        provider_a
+            .settings_config
+            .get("config")
+            .and_then(|value| value.as_str())
+            .expect("provider A TOML config"),
+    )
+    .expect("seed Grok Build live config");
+
+    state
+        .db
+        .save_mcp_server(&grokbuild_mcp_server("grok-mcp", true))
+        .expect("save Grok Build MCP");
+    write_ssot_skill("grok-skill");
+    state
+        .db
+        .save_skill(&installed_grokbuild_skill("local:grok-skill", "grok-skill"))
+        .expect("save Grok Build Skill");
+    state
+        .db
+        .save_prompt(AppType::GrokBuild.as_str(), &prompt("grok-pr-a", true))
+        .expect("save Grok Build prompt A");
+    state
+        .db
+        .save_prompt(AppType::GrokBuild.as_str(), &prompt("grok-pr-b", false))
+        .expect("save Grok Build prompt B");
+
+    let profile = ProfileService::create(&state, "Grok Project", ProfileScope::GrokBuild)
+        .expect("create Grok Build profile");
+    let mut payload: ProfilePayload =
+        serde_json::from_str(&profile.payload).expect("parse Grok Build profile payload");
+    assert_eq!(payload.targets, vec![ProfileScope::GrokBuild]);
+    assert_eq!(payload.providers.grokbuild.as_deref(), Some("grok-a"));
+    assert_eq!(payload.mcp.grokbuild, Some(vec!["grok-mcp".to_string()]));
+    assert_eq!(
+        payload.skills.grokbuild,
+        Some(vec!["local:grok-skill".to_string()])
+    );
+    assert_eq!(payload.prompts.grokbuild.as_deref(), Some("grok-pr-a"));
+    assert_eq!(
+        payload.routing.as_ref().map(|routing| routing.grokbuild),
+        Some(Some(false))
+    );
+
+    payload
+        .routing
+        .as_mut()
+        .expect("Grok Build routing payload")
+        .grokbuild = Some(true);
+    ProfileService::update(&state, &profile.id, None, Some(payload))
+        .expect("save Grok Build profile routing state");
+
+    ProviderService::switch(&state, AppType::GrokBuild, "grok-b")
+        .expect("switch to Grok Build provider B");
+    McpService::toggle_app(&state, "grok-mcp", AppType::GrokBuild, false)
+        .expect("disable Grok Build MCP");
+    SkillService::toggle_app(&state.db, "local:grok-skill", &AppType::GrokBuild, false)
+        .expect("disable Grok Build Skill");
+    PromptService::enable_prompt(&state, AppType::GrokBuild, "grok-pr-b")
+        .expect("enable Grok Build prompt B");
+
+    let rt = tokio::runtime::Runtime::new().expect("create routing runtime");
+    let result = apply_profile_with_runtime(&state, &profile.id, &rt);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected Grok Build warnings: {:?}",
+        result.warnings
+    );
+    assert_eq!(result.target_scopes, vec![ProfileScope::GrokBuild]);
+    assert_eq!(result.routing_targets.len(), 1);
+    assert_eq!(result.routing_targets[0].app, AppType::GrokBuild);
+    assert!(result.routing_targets[0].enabled);
     assert_eq!(
         state
             .db
-            .get_current_profile_id("claude")
-            .expect("get claude current profile id")
+            .get_current_provider(AppType::GrokBuild.as_str())
+            .expect("get current Grok Build provider")
             .as_deref(),
-        Some(project.id.as_str()),
-        "claude side now bound to the shared project"
+        Some("grok-a")
     );
-
-    // 在 Claude 页"以当前状态更新"：补拍 claude 侧，codex 侧快照原样保留
-    let updated =
-        ProfileService::update(&state, &project.id, None, true, Some(ProfileScope::Claude))
-            .expect("resnapshot claude side");
-    let payload: ProfilePayload =
-        serde_json::from_str(&updated.payload).expect("parse updated payload");
-    assert_eq!(payload.providers.claude.as_deref(), Some("p1"));
-    assert_eq!(payload.mcp.claude, Some(vec!["m1".to_string()]));
+    assert!(
+        state
+            .db
+            .get_all_mcp_servers()
+            .expect("get MCP servers")
+            .get("grok-mcp")
+            .expect("Grok Build MCP")
+            .apps
+            .grokbuild
+    );
+    assert!(
+        state
+            .db
+            .get_all_installed_skills()
+            .expect("get installed Skills")
+            .get("local:grok-skill")
+            .expect("Grok Build Skill")
+            .apps
+            .grokbuild
+    );
+    let prompts = state
+        .db
+        .get_prompts(AppType::GrokBuild.as_str())
+        .expect("get Grok Build prompts");
+    assert!(prompts.get("grok-pr-a").expect("prompt A").enabled);
+    assert!(!prompts.get("grok-pr-b").expect("prompt B").enabled);
     assert_eq!(
-        payload.mcp.codex,
-        Some(vec![]),
-        "codex side snapshot preserved by claude-side resnapshot"
+        state
+            .db
+            .get_current_profile_id(ProfileScope::GrokBuild.as_str())
+            .expect("get current Grok Build profile")
+            .as_deref(),
+        Some(profile.id.as_str())
     );
+    assert!(state.db.get_proxy_flags_sync("grokbuild").0);
+
+    rt.block_on(state.proxy_service.set_takeover_for_app("grokbuild", false))
+        .expect("disable Grok Build routing after test");
+    let restored_config =
+        fs::read_to_string(grok_dir.join("config.toml")).expect("read restored Grok Build config");
+    assert!(restored_config.contains("https://grok-a.test/v1"));
 }
 
 #[test]
@@ -422,12 +663,12 @@ fn profile_apply_reports_dangling_references_and_continues() {
     };
     state.db.save_profile(&profile).expect("save profile");
 
-    let (warnings, _) = ProfileService::apply(&state, "dangling-test", ProfileScope::Claude)
-        .expect("apply succeeds");
+    let result = apply_profile(&state, "dangling-test");
     assert_eq!(
-        warnings.len(),
+        result.warnings.len(),
         4,
-        "each dangling reference yields one warning: {warnings:?}"
+        "each dangling reference yields one warning: {:?}",
+        result.warnings
     );
 
     // 有效条目照常生效：m1 被启用
@@ -488,7 +729,44 @@ fn clear_current_profile_only_clears_scoped_marker() {
 }
 
 #[test]
-fn switching_profile_autosaves_previous_profile_state() {
+fn removing_target_clears_marker_without_changing_live_configuration() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_mcp_server(&mcp_server("m1", true))
+        .expect("save mcp m1");
+
+    let profile = ProfileService::create(&state, "Claude Project", ProfileScope::Claude)
+        .expect("create claude profile");
+    apply_profile(&state, &profile.id);
+
+    let mut payload: ProfilePayload =
+        serde_json::from_str(&profile.payload).expect("parse profile payload");
+    payload.targets = vec![ProfileScope::Codex];
+    payload.mcp.codex = Some(vec![]);
+    ProfileService::update(&state, &profile.id, None, Some(payload)).expect("remove claude target");
+
+    assert_eq!(
+        state
+            .db
+            .get_current_profile_id("claude")
+            .expect("get claude current profile"),
+        None,
+        "removed target must no longer show the profile as active"
+    );
+    let servers = state.db.get_all_mcp_servers().expect("get mcp servers");
+    assert!(
+        servers.get("m1").expect("m1").apps.claude,
+        "removing a target must not rewrite the Agent's live configuration"
+    );
+}
+
+#[test]
+fn switching_profile_keeps_saved_snapshots_immutable() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     let home = ensure_test_home();
@@ -539,9 +817,12 @@ fn switching_profile_autosaves_previous_profile_state() {
     // ---- Project A：状态 X（p1 / m1 / pr1）----
     let project_a = ProfileService::create(&state, "Project A", ProfileScope::Claude)
         .expect("create project A");
-    let (warnings, _) = ProfileService::apply(&state, &project_a.id, ProfileScope::Claude)
-        .expect("apply project A");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let result = apply_profile(&state, &project_a.id);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
 
     // ---- 在 A 下改到状态 Y（p2 / m2 / pr2），然后据此创建 Project B ----
     ProviderService::switch(&state, AppType::Claude, "p2").expect("switch to p2");
@@ -552,10 +833,13 @@ fn switching_profile_autosaves_previous_profile_state() {
     let project_b = ProfileService::create(&state, "Project B", ProfileScope::Claude)
         .expect("create project B");
 
-    // ---- 从 A 切换到 B：自动把当前状态 Y 保存到 A，再加载 B 的 Y ----
-    let (warnings, _) = ProfileService::apply(&state, &project_b.id, ProfileScope::Claude)
-        .expect("switch to project B");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    // ---- 从 A 切换到 B：加载 B 的 Y，但绝不把运行态 Y 回写到 A ----
+    let result = apply_profile(&state, &project_b.id);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
 
     assert_eq!(
         state
@@ -576,7 +860,7 @@ fn switching_profile_autosaves_previous_profile_state() {
     assert!(!prompts.get("pr1").expect("pr1").enabled, "pr1 disabled");
     assert!(prompts.get("pr2").expect("pr2").enabled, "pr2 enabled");
 
-    // Project A 被自动保存为离开时的状态 Y
+    // Project A 仍然保持创建时的独立快照 X。
     let saved_a = state
         .db
         .get_profile(&project_a.id)
@@ -584,53 +868,38 @@ fn switching_profile_autosaves_previous_profile_state() {
         .expect("project A exists");
     let payload_a: ProfilePayload =
         serde_json::from_str(&saved_a.payload).expect("parse project A payload");
-    assert_eq!(payload_a.providers.claude.as_deref(), Some("p2"));
-    assert_eq!(payload_a.mcp.claude, Some(vec!["m2".to_string()]));
-    assert_eq!(payload_a.prompts.claude.as_deref(), Some("pr2"));
+    assert_eq!(payload_a.providers.claude.as_deref(), Some("p1"));
+    assert_eq!(payload_a.mcp.claude, Some(vec!["m1".to_string()]));
+    assert_eq!(payload_a.prompts.claude.as_deref(), Some("pr1"));
 
-    // ---- 在 B 下改回状态 X，再切换回 A ----
-    ProviderService::switch(&state, AppType::Claude, "p1").expect("switch to p1");
-    McpService::toggle_app(&state, "m1", AppType::Claude, true).expect("enable m1");
-    McpService::toggle_app(&state, "m2", AppType::Claude, false).expect("disable m2");
-    PromptService::enable_prompt(&state, AppType::Claude, "pr1").expect("enable pr1");
+    // ---- 切回 A：恢复它保存的 X，而不是离开 A 时的运行态 Y ----
+    let result = apply_profile(&state, &project_a.id);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
 
-    let (warnings, _) = ProfileService::apply(&state, &project_a.id, ProfileScope::Claude)
-        .expect("switch back to project A");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-
-    // 切回 A 时：先自动保存 B 为状态 X，再加载 A 的上次离开状态 Y
     assert_eq!(
         state
             .db
             .get_current_provider(AppType::Claude.as_str())
             .expect("get current provider")
             .as_deref(),
-        Some("p2"),
-        "project A restored to the state when we left it (p2)"
+        Some("p1"),
+        "project A restores its saved provider"
     );
     let servers = state.db.get_all_mcp_servers().expect("get mcp servers");
-    assert!(
-        !servers.get("m1").expect("m1").apps.claude,
-        "m1 stays disabled"
-    );
-    assert!(
-        servers.get("m2").expect("m2").apps.claude,
-        "m2 stays enabled"
-    );
+    assert!(servers.get("m1").expect("m1").apps.claude, "m1 restored");
+    assert!(!servers.get("m2").expect("m2").apps.claude, "m2 disabled");
     let prompts = state
         .db
         .get_prompts(AppType::Claude.as_str())
         .expect("get prompts");
-    assert!(
-        !prompts.get("pr1").expect("pr1").enabled,
-        "pr1 stays disabled"
-    );
-    assert!(
-        prompts.get("pr2").expect("pr2").enabled,
-        "pr2 stays enabled"
-    );
+    assert!(prompts.get("pr1").expect("pr1").enabled, "pr1 restored");
+    assert!(!prompts.get("pr2").expect("pr2").enabled, "pr2 disabled");
 
-    // Project B 被自动保存为离开时的状态 X
+    // Project B 也保持创建时的独立快照 Y。
     let saved_b = state
         .db
         .get_profile(&project_b.id)
@@ -638,29 +907,19 @@ fn switching_profile_autosaves_previous_profile_state() {
         .expect("project B exists");
     let payload_b: ProfilePayload =
         serde_json::from_str(&saved_b.payload).expect("parse project B payload");
-    assert_eq!(payload_b.providers.claude.as_deref(), Some("p1"));
-    assert_eq!(payload_b.mcp.claude, Some(vec!["m1".to_string()]));
-    assert_eq!(payload_b.prompts.claude.as_deref(), Some("pr1"));
+    assert_eq!(payload_b.providers.claude.as_deref(), Some("p2"));
+    assert_eq!(payload_b.mcp.claude, Some(vec!["m2".to_string()]));
+    assert_eq!(payload_b.prompts.claude.as_deref(), Some("pr2"));
 }
 
 #[test]
-fn profile_switch_auto_disables_takeover_before_apply() {
+fn profile_routing_supports_enabled_disabled_unmanaged_and_legacy_modes() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     let home = ensure_test_home();
 
     let state = create_test_state().expect("create test state");
-
-    // 使用临时端口，避免测试机器端口冲突
-    futures::executor::block_on(async {
-        let mut proxy_config = state.db.get_proxy_config().await.expect("get proxy config");
-        proxy_config.listen_port = 0;
-        state
-            .db
-            .update_proxy_config(proxy_config)
-            .await
-            .expect("set ephemeral proxy port");
-    });
+    use_ephemeral_proxy_port(&state);
 
     // ---- 两个 Claude 供应商：custom1 与 custom2 ----
     let mut custom1 = claude_provider("custom1", "custom-key-1");
@@ -683,45 +942,41 @@ fn profile_switch_auto_disables_takeover_before_apply() {
     rt.block_on(state.proxy_service.set_takeover_for_app("claude", true))
         .expect("enable claude takeover");
 
-    let (proxy_enabled_before, _) = state.db.get_proxy_flags_sync("claude");
-    assert!(
-        proxy_enabled_before,
-        "takeover should be active before apply"
-    );
+    assert!(state.db.get_proxy_flags_sync("claude").0);
 
-    // ---- 构造一个目标为 custom2 的项目快照 ----
+    // 新方案会快照当前已开启的路由。应用时先恢复真实 Live、切换供应商，
+    // 再重新接管，最终状态仍为开启。
     let project = ProfileService::create(&state, "Custom2 Project", ProfileScope::Claude)
         .expect("create project");
-    let mut project = state
+    let mut saved_project = state
         .db
         .get_profile(&project.id)
         .expect("get project")
         .expect("project exists");
     let mut payload: ProfilePayload =
-        serde_json::from_str(&project.payload).expect("parse project payload");
+        serde_json::from_str(&saved_project.payload).expect("parse project payload");
+    assert_eq!(
+        payload.routing.as_ref().map(|routing| routing.claude),
+        Some(Some(true)),
+        "new profile captures the active routing state"
+    );
     payload.providers.claude = Some("custom2".to_string());
-    project.payload = serde_json::to_string(&payload).expect("serialize payload");
+    saved_project.payload = serde_json::to_string(&payload).expect("serialize payload");
     state
         .db
-        .save_profile(&project)
+        .save_profile(&saved_project)
         .expect("save updated project");
 
-    // ---- 应用项目：应无条件自动关闭接管，再切换到 custom2 ----
-    let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::Claude)
-        .expect("apply custom2 project");
+    let result = apply_profile_with_runtime(&state, &project.id, &rt);
     assert!(
-        warnings.is_empty(),
-        "switching project should not warn: {warnings:?}"
+        result.warnings.is_empty(),
+        "switching project should not warn: {:?}",
+        result.warnings
     );
-
-    // 接管已关闭
-    let (proxy_enabled_after, _) = state.db.get_proxy_flags_sync("claude");
     assert!(
-        !proxy_enabled_after,
-        "proxy takeover should be auto-disabled before applying profile"
+        state.db.get_proxy_flags_sync("claude").0,
+        "managed enabled routing is restored after provider switch"
     );
-
-    // 当前供应商已切到 custom2
     assert_eq!(
         state
             .db
@@ -732,8 +987,62 @@ fn profile_switch_auto_disables_takeover_before_apply() {
         "current provider should be custom2"
     );
 
-    // live 配置应指向 custom2 的真实 endpoint，而非代理地址
     let settings_path = home.join(".claude/settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+            .expect("parse settings");
+    let base_url = settings
+        .get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str());
+    assert!(
+        base_url.is_some_and(|url| url.starts_with("http://127.0.0.1:")),
+        "enabled routing writes the local proxy endpoint, got {base_url:?}"
+    );
+
+    // 未管理路由：切换供应商时保留既有接管，通过现有代理热切换路径生效。
+    payload.providers.claude = Some("custom1".to_string());
+    payload.routing.as_mut().expect("routing payload").claude = None;
+    ProfileService::update(&state, &project.id, None, Some(payload.clone()))
+        .expect("save unmanaged routing profile");
+    let result = apply_profile_with_runtime(&state, &project.id, &rt);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
+    assert!(
+        result.routing_targets.is_empty(),
+        "unmanaged routing must not schedule a route change"
+    );
+    assert!(
+        state.db.get_proxy_flags_sync("claude").0,
+        "unmanaged routing preserves active takeover"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Claude.as_str())
+            .expect("get current provider")
+            .as_deref(),
+        Some("custom1")
+    );
+
+    // 显式关闭：退出接管并把目标供应商的真实 endpoint 写回 Live。
+    payload.providers.claude = Some("custom2".to_string());
+    payload.routing.as_mut().expect("routing payload").claude = Some(false);
+    ProfileService::update(&state, &project.id, None, Some(payload.clone()))
+        .expect("save disabled routing profile");
+    let result = apply_profile_with_runtime(&state, &project.id, &rt);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
+    assert!(
+        !state.db.get_proxy_flags_sync("claude").0,
+        "managed disabled routing turns takeover off"
+    );
     let settings: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
             .expect("parse settings");
@@ -744,7 +1053,59 @@ fn profile_switch_auto_disables_takeover_before_apply() {
     assert_eq!(
         base_url,
         Some("https://api.test"),
-        "live config should point to real endpoint after auto-disable"
+        "disabled routing restores the real provider endpoint"
+    );
+
+    // 从关闭状态显式开启，验证方案能够启动服务并接管 Live。
+    payload.providers.claude = Some("custom1".to_string());
+    payload.routing.as_mut().expect("routing payload").claude = Some(true);
+    ProfileService::update(&state, &project.id, None, Some(payload))
+        .expect("save enabled routing profile");
+    let result = apply_profile_with_runtime(&state, &project.id, &rt);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
+    assert!(
+        state.db.get_proxy_flags_sync("claude").0,
+        "managed enabled routing starts takeover"
+    );
+
+    // 旧方案完全没有 routing 字段，必须继续沿用升级前的行为：关闭路由。
+    let legacy_profile = cc_switch_lib::Profile {
+        id: "legacy-routing-profile".to_string(),
+        name: "Legacy routing profile".to_string(),
+        payload: json!({
+            "targets": ["claude"],
+            "providers": { "claude": "custom2" }
+        })
+        .to_string(),
+        sort_order: None,
+        created_at: Some(1_000),
+        updated_at: Some(1_000),
+    };
+    state
+        .db
+        .save_profile(&legacy_profile)
+        .expect("save legacy profile");
+    let result = apply_profile_with_runtime(&state, &legacy_profile.id, &rt);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
+    assert!(
+        !state.db.get_proxy_flags_sync("claude").0,
+        "legacy profile preserves the historical auto-disable behavior"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Claude.as_str())
+            .expect("get current provider")
+            .as_deref(),
+        Some("custom2")
     );
 }
 
@@ -789,9 +1150,12 @@ fn claude_desktop_profile_scope_is_independent() {
     ProviderService::switch(&state, AppType::ClaudeDesktop, "d2").expect("switch desktop to d2");
 
     // 应用 Desktop 项目：恢复 d1
-    let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::ClaudeDesktop)
-        .expect("apply desktop profile");
-    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let result = apply_profile(&state, &project.id);
+    assert!(
+        result.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        result.warnings
+    );
 
     assert_eq!(
         state

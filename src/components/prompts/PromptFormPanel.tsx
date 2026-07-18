@@ -85,7 +85,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
       await onSave(id, prompt);
       onClose();
     } catch (error) {
-      // Error handled by hook
+      console.error("[PromptFormPanel] Failed to save prompt", error);
     } finally {
       setSaving(false);
     }

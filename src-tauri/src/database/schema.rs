@@ -115,6 +115,9 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // 6a. Skill Groups 表（用户自定义多对多分组）
+        Self::create_skill_group_tables(conn)?;
+
         // 7. Settings 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)",
@@ -497,6 +500,9 @@ impl Database {
                         Self::set_user_version(conn, 13)?;
                     }
                     13 => {
+                        // 兼容曾将 Skills 分组标记为 schema v13 的 fork 数据库。
+                        // 官方 v12 -> v13 迁移是幂等的，重复执行不会覆盖已有数据。
+                        Self::migrate_v12_to_v13(conn)?;
                         log::info!("迁移数据库从 v13 到 v14（添加 Grok Build 代理配置）");
                         Self::migrate_v13_to_v14(conn)?;
                         Self::set_user_version(conn, 14)?;
@@ -510,6 +516,11 @@ impl Database {
                         log::info!("迁移数据库从 v15 到 v16（重建 Codex 会话用量）");
                         Self::migrate_v15_to_v16(conn)?;
                         Self::set_user_version(conn, 16)?;
+                    }
+                    16 => {
+                        log::info!("迁移数据库从 v16 到 v17（添加 Skills 分组）");
+                        Self::migrate_v16_to_v17(conn)?;
+                        Self::set_user_version(conn, 17)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1521,6 +1532,67 @@ impl Database {
     fn migrate_v15_to_v16(conn: &Connection) -> Result<(), AppError> {
         let codex_dir = crate::codex_config::get_codex_config_dir();
         crate::services::session_usage_codex::reset_codex_usage_on_conn(conn, &codex_dir)
+    }
+
+    /// 创建 Skill 分组及成员关系表。新库和 v16 -> v17 迁移共用此幂等入口。
+    fn create_skill_group_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS skill_group_members (
+                group_id TEXT NOT NULL,
+                skill_id TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, skill_id),
+                FOREIGN KEY (group_id) REFERENCES skill_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_group_members_skill_id
+                ON skill_group_members(skill_id);",
+        )
+        .map_err(|e| AppError::Database(format!("创建 Skills 分组表失败: {e}")))?;
+        Ok(())
+    }
+
+    /// v16 -> v17 迁移：添加全局 Skills 分组并修复旧 fork 的成员外键。
+    fn migrate_v16_to_v17(conn: &Connection) -> Result<(), AppError> {
+        Self::create_skill_group_tables(conn)?;
+
+        // 生产初始化会先补齐 skills 表；部分连接级迁移测试只构造当前版本关注的
+        // 最小表集。此时没有可校验的成员关系，保留空分组表即可完成迁移。
+        if !Self::table_exists(conn, "skills")? {
+            return Ok(());
+        }
+
+        // 旧版本会在迁移链前补建分组表。若随后重建过 skills，SQLite 可能把成员表
+        // 的外键目标改为临时旧表。重建成员表并复制有效关系，同时保留 fork v13
+        // 已经创建的分组及排序。
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS skill_group_members_v17;
+             CREATE TABLE skill_group_members_v17 (
+                group_id TEXT NOT NULL,
+                skill_id TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, skill_id),
+                FOREIGN KEY (group_id) REFERENCES skill_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+             );
+             INSERT OR IGNORE INTO skill_group_members_v17 (group_id, skill_id, sort_order)
+             SELECT members.group_id, members.skill_id, members.sort_order
+             FROM skill_group_members AS members
+             INNER JOIN skill_groups AS groups ON groups.id = members.group_id
+             INNER JOIN skills ON skills.id = members.skill_id;
+             DROP TABLE skill_group_members;
+             ALTER TABLE skill_group_members_v17 RENAME TO skill_group_members;
+             CREATE INDEX IF NOT EXISTS idx_skill_group_members_skill_id
+                ON skill_group_members(skill_id);",
+        )
+        .map_err(|e| AppError::Database(format!("重建 Skills 分组表失败: {e}")))?;
+        Ok(())
     }
 
     /// 插入默认模型定价数据
@@ -3065,7 +3137,7 @@ mod tests {
 
         Database::apply_schema_migrations_on_conn(&conn)?;
 
-        assert_eq!(Database::get_user_version(&conn)?, 16);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         let counts: (i64, i64, i64, i64) = conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'),

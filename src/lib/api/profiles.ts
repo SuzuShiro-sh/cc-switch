@@ -3,10 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 /**
  * Profile 操作的应用分组（与后端 services/profile.rs 的 ProfileScope 严格对应）
  *
- * 项目实体全应用共享，但快照/应用/当前指针按组进行；Claude Code 与
- * Claude Desktop 的供应商独立切换，因此各自有独立分组。
+ * 项目实体全应用共享，快照槽位和当前指针按组保存；应用时由 targets
+ * 决定一次需要整体切换哪些分组。
  */
-export type ProfileScope = "claude" | "claude-desktop" | "codex";
+export type ProfileScope =
+  | "claude"
+  | "claude-desktop"
+  | "codex"
+  | "gemini"
+  | "grokbuild";
 
 /**
  * 按 app 分槽的载荷容器（与后端 services/profile.rs 的 PerApp<T> 严格对应）
@@ -15,6 +20,8 @@ export interface PerApp<T> {
   claude: T;
   "claude-desktop": T;
   codex: T;
+  gemini: T;
+  grokbuild: T;
 }
 
 /**
@@ -24,10 +31,16 @@ export interface PerApp<T> {
  * （空数组，应用时清空启用）严格区分。
  */
 export interface ProfilePayload {
+  targets: ProfileScope[];
   providers: PerApp<string | null>;
   mcp: PerApp<string[] | null>;
   skills: PerApp<string[] | null>;
   prompts: PerApp<string | null>;
+  /**
+   * 每个 Agent 的 CC Switch 路由状态：true/false 为方案显式管理，
+   * null 为保持切换前状态。旧方案可能完全缺少该字段。
+   */
+  routing?: PerApp<boolean | null> | null;
 }
 
 export interface Profile {
@@ -47,6 +60,8 @@ export interface CurrentProfileIds {
   claude: string | null;
   claudeDesktop: string | null;
   codex: string | null;
+  gemini: string | null;
+  grokbuild: string | null;
 }
 
 export interface ProfilesResponse {
@@ -70,18 +85,19 @@ export const profilesApi = {
   },
 
   /**
-   * 更新项目：重命名（作用于共享实体）和/或以当前状态重拍快照
-   * （resnapshot 只覆盖 scope 分组的槽位，其余分组原样保留）
+   * 更新项目名称和/或显式编辑后的独立配置快照
    */
   async update(
     id: string,
-    options: { name?: string; resnapshot?: boolean; scope?: ProfileScope },
+    options: {
+      name?: string;
+      payload?: ProfilePayload;
+    },
   ): Promise<Profile> {
     return await invoke("update_profile", {
       id,
       name: options.name,
-      resnapshot: options.resnapshot,
-      scope: options.scope,
+      payload: options.payload,
     });
   },
 
@@ -93,11 +109,10 @@ export const profilesApi = {
   },
 
   /**
-   * 应用项目快照（只作用于发起页所属分组内的应用），返回 warnings
-   * （best-effort，部分失败不中断）
+   * 按 targets 整体应用 1 个或多个 Agent，返回 warnings
    */
-  async apply(id: string, scope: ProfileScope): Promise<string[]> {
-    return await invoke("apply_profile", { id, scope });
+  async apply(id: string): Promise<string[]> {
+    return await invoke("apply_profile", { id });
   },
 
   /**

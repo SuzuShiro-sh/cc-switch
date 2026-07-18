@@ -380,8 +380,8 @@ fn sort_providers(
 
 /// 处理项目 Profile 托盘事件，返回是否已处理
 ///
-/// 事件 id 形如 `profile_<scope>_<uuid>`（同一项目在各分组子菜单里各有一项，
-/// 应用时只作用于该分组）；`profile_none_<scope>` 表示某分组"不使用项目"
+/// 事件 id 形如 `profile_<scope>_<uuid>`（scope 只表示点击来源菜单；应用时按
+/// 方案 targets 整体切换）；`profile_none_<scope>` 表示某分组"不使用项目"
 /// （只清该分组标记，不动配置）。
 pub fn handle_profile_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool {
     let Some(suffix) = event_id.strip_prefix("profile_") else {
@@ -414,49 +414,36 @@ pub fn handle_profile_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool
         log::error!("无法解析项目托盘事件: {event_id}");
         return true;
     };
-    let Ok(scope) = crate::services::profile::ProfileScope::parse(scope_str) else {
+    if crate::services::profile::ProfileScope::parse(scope_str).is_err() {
         log::error!("未知的项目分组托盘事件: {event_id}");
         return true;
-    };
+    }
 
-    log::info!("应用项目: {profile_id}（{scope_str} 组）");
+    log::info!("应用项目捆绑包: {profile_id}（来自 {scope_str} 组菜单）");
     let app_handle = app.clone();
     let profile_id = profile_id.to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(app_state) = app_handle.try_state::<AppState>() else {
             return;
         };
-        match crate::services::profile::ProfileService::apply(app_state.inner(), &profile_id, scope)
-        {
-            Ok((warnings, should_stop_proxy)) => {
-                for warning in &warnings {
-                    log::warn!("[Profile] 应用项目 {profile_id} 警告: {warning}");
-                }
-
-                if should_stop_proxy {
-                    let app_handle2 = app_handle.clone();
-                    let proxy_service = app_state.proxy_service.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = proxy_service.stop().await {
-                            log::warn!("托盘切换项目后停止代理服务失败: {e}");
-                        }
-                        if let Some(state) = app_handle2.try_state::<AppState>() {
-                            crate::commands::emit_profile_apply_events(
-                                &app_handle2,
-                                state.inner(),
-                                &profile_id,
-                                scope,
-                            );
-                        }
-                    });
-                } else {
-                    crate::commands::emit_profile_apply_events(
-                        &app_handle,
-                        app_state.inner(),
+        match crate::services::profile::ProfileService::apply(app_state.inner(), &profile_id) {
+            Ok(result) => {
+                let finalize_app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let Some(state) = finalize_app.try_state::<AppState>() else {
+                        return;
+                    };
+                    let warnings = crate::commands::finalize_profile_apply(
+                        &finalize_app,
+                        state.inner(),
                         &profile_id,
-                        scope,
-                    );
-                }
+                        result,
+                    )
+                    .await;
+                    for warning in &warnings {
+                        log::warn!("[Profile] 应用项目 {profile_id} 警告: {warning}");
+                    }
+                });
             }
             Err(e) => {
                 log::error!("应用项目 {profile_id} 失败: {e}");
@@ -759,7 +746,7 @@ pub fn create_tray_menu(
     // 项目 Profile 子菜单：项目列表全应用共享，按分组嵌套子菜单各自勾选/应用
     // （组内应用可见且存在项目时才显示该组）
     {
-        use crate::services::profile::ProfileScope;
+        use crate::services::profile::{ProfilePayload, ProfileScope};
 
         let any_scope_visible = ProfileScope::ALL.iter().any(|scope| {
             scope
@@ -775,12 +762,28 @@ pub fn create_tray_menu(
 
         let mut scope_submenus = Vec::new();
         for scope in ProfileScope::ALL {
-            if profiles.is_empty()
-                || !scope
-                    .apps()
-                    .iter()
-                    .any(|app_type| visible_apps.is_visible(app_type))
+            if !scope
+                .apps()
+                .iter()
+                .any(|app_type| visible_apps.is_visible(app_type))
             {
+                continue;
+            }
+            let scope_profiles: Vec<_> = profiles
+                .iter()
+                .filter(|profile| {
+                    serde_json::from_str::<ProfilePayload>(&profile.payload)
+                        .map(|payload| payload.targets_scope(scope))
+                        .unwrap_or_else(|error| {
+                            log::warn!(
+                                "解析 profile '{}' payload 失败，托盘中跳过: {error}",
+                                profile.id
+                            );
+                            false
+                        })
+                })
+                .collect();
+            if scope_profiles.is_empty() {
                 continue;
             }
             let current_profile_id = app_state
@@ -792,13 +795,15 @@ pub fn create_tray_menu(
                 ProfileScope::Claude => "Claude Code",
                 ProfileScope::ClaudeDesktop => "Claude Desktop",
                 ProfileScope::Codex => "Codex",
+                ProfileScope::Gemini => "Gemini",
+                ProfileScope::GrokBuild => "Grok Build",
             };
             let mut scope_builder = SubmenuBuilder::with_id(
                 app,
                 format!("submenu_profiles_{}", scope.as_str()),
                 scope_label,
             );
-            for profile in &profiles {
+            for profile in scope_profiles {
                 let item = CheckMenuItem::with_id(
                     app,
                     format!("profile_{}_{}", scope.as_str(), profile.id),

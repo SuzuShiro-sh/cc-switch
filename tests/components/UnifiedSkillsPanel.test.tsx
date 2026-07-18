@@ -27,6 +27,10 @@ vi.mock("@/hooks/useSkills", () => ({
     data: [],
     isLoading: false,
   }),
+  useSkillGroups: () => ({
+    data: [],
+    isLoading: false,
+  }),
   useSkillBackups: () => ({
     data: [],
     refetch: vi.fn(),

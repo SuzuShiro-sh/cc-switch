@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
 use crate::database::Profile;
-use crate::services::profile::{ProfilePayload, ProfileScope, ProfileService};
+use crate::services::profile::{ProfileApplyResult, ProfilePayload, ProfileScope, ProfileService};
 use crate::store::AppState;
 
 #[derive(Debug, Serialize)]
@@ -46,6 +46,8 @@ pub struct CurrentProfileIds {
     pub claude: Option<String>,
     pub claude_desktop: Option<String>,
     pub codex: Option<String>,
+    pub gemini: Option<String>,
+    pub grokbuild: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,32 +66,55 @@ pub fn emit_profile_apply_events(
     app: &tauri::AppHandle,
     state: &AppState,
     profile_id: &str,
-    scope: ProfileScope,
+    scopes: &[ProfileScope],
 ) {
-    for app_type in scope.apps().iter() {
-        let app_str = app_type.as_str();
-        let (proxy_enabled, auto_failover_enabled) = state.db.get_proxy_flags_sync(app_str);
-        let provider_id = crate::settings::get_effective_current_provider(&state.db, app_type)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let event_data = serde_json::json!({
-            "appType": app_str,
-            "proxyEnabled": proxy_enabled,
-            "autoFailoverEnabled": auto_failover_enabled,
-            "providerId": provider_id,
-        });
-        if let Err(e) = app.emit("provider-switched", event_data) {
-            log::error!("发射 provider-switched 事件失败: {e}");
+    for scope in scopes {
+        for app_type in scope.apps().iter() {
+            let app_str = app_type.as_str();
+            let (proxy_enabled, auto_failover_enabled) = state.db.get_proxy_flags_sync(app_str);
+            let provider_id = crate::settings::get_effective_current_provider(&state.db, app_type)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let event_data = serde_json::json!({
+                "appType": app_str,
+                "proxyEnabled": proxy_enabled,
+                "autoFailoverEnabled": auto_failover_enabled,
+                "providerId": provider_id,
+            });
+            if let Err(e) = app.emit("provider-switched", event_data) {
+                log::error!("发射 provider-switched 事件失败: {e}");
+            }
         }
     }
+    let scope_names: Vec<&str> = scopes.iter().map(ProfileScope::as_str).collect();
+    let primary_scope = scope_names.first().copied();
     if let Err(e) = app.emit(
         "profile-applied",
-        serde_json::json!({ "profileId": profile_id, "scope": scope.as_str() }),
+        serde_json::json!({
+            "profileId": profile_id,
+            "scope": primary_scope,
+            "scopes": scope_names,
+        }),
     ) {
         log::error!("发射 profile-applied 事件失败: {e}");
     }
     crate::tray::refresh_tray_menu(app);
+}
+
+/// 在异步运行时完成 Profile 路由状态并发送最终刷新事件。
+///
+/// 页面与托盘入口共用此函数，确保事件只在 Live 配置、路由服务和数据库状态
+/// 全部收敛后发出，前端不会读取到“基础配置已切换、路由尚未恢复”的中间态。
+pub async fn finalize_profile_apply(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    profile_id: &str,
+    mut result: ProfileApplyResult,
+) -> Vec<String> {
+    ProfileService::finalize_routing(state, &result.routing_targets, &mut result.warnings).await;
+    emit_profile_apply_events(app, state, profile_id, &result.target_scopes);
+    result.warnings
 }
 
 #[tauri::command]
@@ -107,6 +132,14 @@ pub fn list_profiles(state: State<'_, AppState>) -> Result<ProfilesResponse, Str
         codex: state
             .db
             .get_current_profile_id(ProfileScope::Codex.as_str())
+            .map_err(|e| e.to_string())?,
+        gemini: state
+            .db
+            .get_current_profile_id(ProfileScope::Gemini.as_str())
+            .map_err(|e| e.to_string())?,
+        grokbuild: state
+            .db
+            .get_current_profile_id(ProfileScope::GrokBuild.as_str())
             .map_err(|e| e.to_string())?,
     };
     Ok(ProfilesResponse {
@@ -132,14 +165,9 @@ pub fn update_profile(
     state: State<'_, AppState>,
     id: String,
     name: Option<String>,
-    resnapshot: Option<bool>,
-    scope: Option<String>,
+    payload: Option<ProfilePayload>,
 ) -> Result<ProfileDto, String> {
-    let scope = scope
-        .map(|s| ProfileScope::parse(&s))
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    ProfileService::update(&state, &id, name, resnapshot.unwrap_or(false), scope)
+    ProfileService::update(&state, &id, name, payload)
         .map(ProfileDto::from)
         .map_err(|e| e.to_string())
 }
@@ -158,38 +186,26 @@ pub fn clear_current_profile(state: State<'_, AppState>, scope: String) -> Resul
         .map_err(|e| e.to_string())
 }
 
-/// 应用项目快照（只作用于发起页所属分组内的应用）。
+/// 按项目 targets 整体应用 1 个或多个 Agent 的配置快照。
 ///
-/// 注意：必须保持同步命令（跑在 Tauri 线程池）——`ProviderService::switch`
-/// 内部使用 block_on 获取切换锁，放进 async 命令会在运行时线程上 panic。
+/// Provider/MCP/Skills/Prompt 阶段必须在 blocking 线程执行，因为
+/// `ProviderService::switch` 内部同步等待每 Agent 切换锁；路由接管阶段需要
+/// Tokio 网络运行时，因此基础配置完成后回到 async 命令线程统一最终化。
 #[tauri::command]
-pub fn apply_profile(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-    scope: String,
-) -> Result<Vec<String>, String> {
-    let scope = ProfileScope::parse(&scope).map_err(|e| e.to_string())?;
-    let (warnings, should_stop_proxy) =
-        ProfileService::apply(&state, &id, scope).map_err(|e| e.to_string())?;
+pub async fn apply_profile(app: tauri::AppHandle, id: String) -> Result<Vec<String>, String> {
+    let apply_app = app.clone();
+    let apply_id = id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = apply_app
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        ProfileService::apply(state.inner(), &apply_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("等待组合配置应用任务失败: {e}"))??;
 
-    if should_stop_proxy {
-        // sync 命令线程没有 Tokio runtime，无法直接 await stop()；
-        // 把停止服务放到 Tauri async runtime，停止后再补发事件刷新 UI。
-        let app_handle = app.clone();
-        let profile_id = id.clone();
-        let proxy_service = state.proxy_service.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = proxy_service.stop().await {
-                log::warn!("切换项目后停止代理服务失败: {e}");
-            }
-            if let Some(app_state) = app_handle.try_state::<AppState>() {
-                emit_profile_apply_events(&app_handle, app_state.inner(), &profile_id, scope);
-            }
-        });
-    } else {
-        emit_profile_apply_events(&app, &state, &id, scope);
-    }
-
-    Ok(warnings)
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "应用状态不可用".to_string())?;
+    Ok(finalize_profile_apply(&app, state.inner(), &id, result).await)
 }

@@ -224,6 +224,20 @@ pub struct InstalledSkill {
     pub updated_at: i64,
 }
 
+/// 用户定义的 Skill 分组。
+///
+/// 分组是全局管理元数据；配置方案仍保存展开后的 Skill ID，避免修改分组后
+/// 隐式改变已经保存的方案快照。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillGroup {
+    pub id: String,
+    pub name: String,
+    pub skill_ids: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// 未管理的 Skill（在应用目录中发现但未被 CC Switch 管理）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

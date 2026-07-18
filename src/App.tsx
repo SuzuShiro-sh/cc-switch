@@ -25,6 +25,7 @@ import {
   Shield,
   Cpu,
   LayoutDashboard,
+  FolderCog,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -59,6 +60,8 @@ import {
 } from "@/lib/platform";
 import { AppSwitcher } from "@/components/AppSwitcher";
 import { ProfileSwitcher } from "@/components/profiles/ProfileSwitcher";
+import { ConfigSetsPage } from "@/components/profiles/ConfigSetsPage";
+import { CONFIG_SET_SCOPES } from "@/components/profiles/scope";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
@@ -107,6 +110,7 @@ type View =
   | "universal"
   | "sessions"
   | "workspace"
+  | "configSets"
   | "openclawEnv"
   | "openclawTools"
   | "openclawAgents"
@@ -153,6 +157,7 @@ const VALID_VIEWS: View[] = [
   "universal",
   "sessions",
   "workspace",
+  "configSets",
   "openclawEnv",
   "openclawTools",
   "openclawAgents",
@@ -961,6 +966,8 @@ function App() {
           );
         case "workspace":
           return <WorkspaceFilesPanel />;
+        case "configSets":
+          return <ConfigSetsPage initialApp={activeApp} />;
         case "openclawEnv":
           return <EnvPanel />;
         case "openclawTools":
@@ -1184,6 +1191,10 @@ function App() {
                     })}
                   {currentView === "sessions" && t("sessionManager.title")}
                   {currentView === "workspace" && t("workspace.title")}
+                  {currentView === "configSets" &&
+                    t("configSets.title", {
+                      defaultValue: "配置方案",
+                    })}
                   {currentView === "openclawEnv" && t("openclaw.env.title")}
                   {currentView === "openclawTools" && t("openclaw.tools.title")}
                   {currentView === "openclawAgents" &&
@@ -1269,12 +1280,28 @@ function App() {
                 </div>
               )}
             {currentView === "providers" &&
-              (settingsData?.showProfileSwitcher ?? true) && (
+              ((settingsData?.showProfileSwitcher ?? true) ||
+                CONFIG_SET_SCOPES.some((scope) => scope === activeApp)) && (
                 <div
-                  className="flex shrink-0 items-center"
+                  className="flex shrink-0 items-center gap-1"
                   style={{ WebkitAppRegion: "no-drag" } as any}
                 >
-                  <ProfileSwitcher activeApp={activeApp} />
+                  {(settingsData?.showProfileSwitcher ?? true) && (
+                    <ProfileSwitcher activeApp={activeApp} />
+                  )}
+                  {CONFIG_SET_SCOPES.some((scope) => scope === activeApp) && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setCurrentView("configSets")}
+                      className="h-8 px-2.5 text-muted-foreground hover:bg-black/5 hover:text-foreground dark:hover:bg-white/5"
+                      title={t("configSets.title", {
+                        defaultValue: "配置方案",
+                      })}
+                    >
+                      <FolderCog className="h-4 w-4" />
+                    </Button>
+                  )}
                 </div>
               )}
             <div

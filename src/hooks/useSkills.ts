@@ -10,6 +10,7 @@ import {
   type DiscoverableSkill,
   type ImportSkillSelection,
   type InstalledSkill,
+  type SkillGroup,
   type SkillUpdateInfo,
   type SkillsShSearchResult,
 } from "@/lib/api/skills";
@@ -27,6 +28,65 @@ export function useInstalledSkills() {
     queryFn: () => skillsApi.getInstalled(),
     staleTime: Infinity,
     placeholderData: keepPreviousData,
+  });
+}
+
+export function useSkillGroups() {
+  return useQuery({
+    queryKey: ["skills", "groups"],
+    queryFn: () => skillsApi.getGroups(),
+  });
+}
+
+export function useCreateSkillGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, skillIds }: { name: string; skillIds: string[] }) =>
+      skillsApi.createGroup(name, skillIds),
+    onSuccess: (created) => {
+      queryClient.setQueryData<SkillGroup[]>(["skills", "groups"], (current) =>
+        current ? [...current, created] : [created],
+      );
+      queryClient.invalidateQueries({ queryKey: ["skills", "groups"] });
+    },
+  });
+}
+
+export function useUpdateSkillGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      name,
+      skillIds,
+    }: {
+      id: string;
+      name: string;
+      skillIds: string[];
+    }) => skillsApi.updateGroup(id, name, skillIds),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<SkillGroup[]>(
+        ["skills", "groups"],
+        (current) =>
+          current?.map((group) =>
+            group.id === updated.id ? updated : group,
+          ) ?? [updated],
+      );
+      queryClient.invalidateQueries({ queryKey: ["skills", "groups"] });
+    },
+  });
+}
+
+export function useDeleteSkillGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => skillsApi.deleteGroup(id),
+    onSuccess: (_deleted, id) => {
+      queryClient.setQueryData<SkillGroup[]>(["skills", "groups"], (current) =>
+        current?.filter((group) => group.id !== id),
+      );
+      queryClient.invalidateQueries({ queryKey: ["skills", "groups"] });
+    },
   });
 }
 
@@ -360,6 +420,7 @@ export type {
   ImportSkillSelection,
   SkillBackupEntry,
   SkillUpdateInfo,
+  SkillGroup,
   SkillsShSearchResult,
   AppId,
 };

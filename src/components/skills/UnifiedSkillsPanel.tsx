@@ -4,11 +4,22 @@ import {
   Sparkles,
   Trash2,
   ExternalLink,
+  FolderOpen,
+  FolderTree,
   RefreshCw,
   Loader2,
+  Search,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   type ImportSkillSelection,
@@ -24,9 +35,11 @@ import {
   useInstallSkillsFromZip,
   useCheckSkillUpdates,
   useUpdateSkill,
+  useSkillGroups,
   type InstalledSkill,
   type SkillUpdateInfo,
 } from "@/hooks/useSkills";
+import { SkillGroupManager } from "@/components/skills/SkillGroupManager";
 import type { AppId } from "@/lib/api/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { settingsApi, skillsApi } from "@/lib/api";
@@ -79,8 +92,12 @@ const UnifiedSkillsPanel = React.forwardRef<
   } | null>(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [groupFilter, setGroupFilter] = useState("all");
+  const [groupManagerOpen, setGroupManagerOpen] = useState(false);
 
   const { data: skills, isLoading } = useInstalledSkills();
+  const { data: skillGroups = [] } = useSkillGroups();
   const {
     data: skillBackups = [],
     refetch: refetchSkillBackups,
@@ -132,6 +149,37 @@ const UnifiedSkillsPanel = React.forwardRef<
     });
     return counts;
   }, [skills]);
+
+  const filteredSkills = useMemo(() => {
+    if (!skills) return [];
+    const query = search.trim().toLocaleLowerCase();
+    const groupedIds = new Set(skillGroups.flatMap((group) => group.skillIds));
+    const selectedGroup = skillGroups.find((group) => group.id === groupFilter);
+    const selectedGroupIds = new Set(selectedGroup?.skillIds ?? []);
+    return skills.filter((skill) => {
+      const matchesQuery =
+        !query ||
+        `${skill.name} ${skill.description ?? ""} ${skill.directory} ${skill.repoOwner ?? ""} ${skill.repoName ?? ""}`
+          .toLocaleLowerCase()
+          .includes(query);
+      const matchesGroup =
+        groupFilter === "all" ||
+        (groupFilter === "ungrouped"
+          ? !groupedIds.has(skill.id)
+          : selectedGroupIds.has(skill.id));
+      return matchesQuery && matchesGroup;
+    });
+  }, [groupFilter, search, skillGroups, skills]);
+
+  React.useEffect(() => {
+    if (
+      groupFilter !== "all" &&
+      groupFilter !== "ungrouped" &&
+      !skillGroups.some((group) => group.id === groupFilter)
+    ) {
+      setGroupFilter("all");
+    }
+  }, [groupFilter, skillGroups]);
 
   const handleToggleApp = async (id: string, app: AppId, enabled: boolean) => {
     try {
@@ -287,6 +335,17 @@ const UnifiedSkillsPanel = React.forwardRef<
     }
   };
 
+  const handleOpenFolder = async (skill: InstalledSkill) => {
+    try {
+      await skillsApi.openFolder(skill.id);
+    } catch (error) {
+      toast.error(
+        t("skills.openFolderFailed", { defaultValue: "打开目录失败" }),
+        { description: String(error) },
+      );
+    }
+  };
+
   const handleRestoreFromBackup = async (backupId: string) => {
     try {
       const restored = await restoreBackupMutation.mutateAsync({
@@ -401,6 +460,46 @@ const UnifiedSkillsPanel = React.forwardRef<
         </div>
       </div>
 
+      <div className="flex flex-wrap items-center gap-2 border-b py-3">
+        <div className="relative min-w-52 flex-1 md:max-w-sm">
+          <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            className="h-9 pl-8"
+            placeholder={t("skills.searchPlaceholder")}
+          />
+        </div>
+        <Select value={groupFilter} onValueChange={setGroupFilter}>
+          <SelectTrigger className="h-9 w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">
+              {t("skills.groups.all", { defaultValue: "全部 Skills" })}
+            </SelectItem>
+            <SelectItem value="ungrouped">
+              {t("skills.groups.ungrouped", { defaultValue: "未分组" })}
+            </SelectItem>
+            {skillGroups.map((group) => (
+              <SelectItem key={group.id} value={group.id}>
+                {group.name} ({group.skillIds.length})
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-9"
+          onClick={() => setGroupManagerOpen(true)}
+        >
+          <FolderTree className="mr-2 h-4 w-4" />
+          {t("skills.groups.manage", { defaultValue: "管理分组" })}
+        </Button>
+      </div>
+
       <div className="flex-1 overflow-y-auto overflow-x-hidden pb-24">
         {isLoading ? (
           <div className="text-center py-12 text-muted-foreground">
@@ -418,10 +517,14 @@ const UnifiedSkillsPanel = React.forwardRef<
               {t("skills.noInstalledDescription")}
             </p>
           </div>
+        ) : filteredSkills.length === 0 ? (
+          <div className="py-12 text-center text-sm text-muted-foreground">
+            {t("skills.noResults")}
+          </div>
         ) : (
           <TooltipProvider delayDuration={300}>
             <div className="rounded-xl border border-border-default overflow-hidden">
-              {skills.map((skill, index) => (
+              {filteredSkills.map((skill, index) => (
                 <InstalledSkillListItem
                   key={skill.id}
                   skill={skill}
@@ -433,7 +536,8 @@ const UnifiedSkillsPanel = React.forwardRef<
                   onToggleApp={handleToggleApp}
                   onUninstall={() => handleUninstall(skill)}
                   onUpdate={() => handleUpdateSkill(skill)}
-                  isLast={index === skills.length - 1}
+                  onOpenFolder={() => handleOpenFolder(skill)}
+                  isLast={index === filteredSkills.length - 1}
                 />
               ))}
             </div>
@@ -473,6 +577,14 @@ const UnifiedSkillsPanel = React.forwardRef<
         onClose={() => setRestoreDialogOpen(false)}
         open={restoreDialogOpen}
       />
+
+      {groupManagerOpen && (
+        <SkillGroupManager
+          isOpen
+          onClose={() => setGroupManagerOpen(false)}
+          skills={skills ?? []}
+        />
+      )}
     </div>
   );
 });
@@ -486,6 +598,7 @@ interface InstalledSkillListItemProps {
   onToggleApp: (id: string, app: AppId, enabled: boolean) => void;
   onUninstall: () => void;
   onUpdate?: () => void;
+  onOpenFolder: () => void;
   isLast?: boolean;
 }
 
@@ -496,6 +609,7 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
   onToggleApp,
   onUninstall,
   onUpdate,
+  onOpenFolder,
   isLast,
 }) => {
   const { t } = useTranslation();
@@ -504,8 +618,8 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
     if (!skill.readmeUrl) return;
     try {
       await settingsApi.openExternal(skill.readmeUrl);
-    } catch {
-      // ignore
+    } catch (error) {
+      toast.error(t("common.error"), { description: String(error) });
     }
   };
 
@@ -520,9 +634,13 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
     <ListItemRow isLast={isLast}>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5">
-          <span className="font-medium text-sm text-foreground truncate">
+          <button
+            type="button"
+            onClick={onOpenFolder}
+            className="truncate text-left text-sm font-medium text-foreground hover:underline"
+          >
             {skill.name}
-          </span>
+          </button>
           {skill.readmeUrl && (
             <button
               type="button"
@@ -564,6 +682,16 @@ const InstalledSkillListItem: React.FC<InstalledSkillListItemProps> = ({
         className="flex-shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
         style={hasUpdate ? { opacity: 1 } : undefined}
       >
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 hover:bg-muted"
+          onClick={onOpenFolder}
+          title={t("skills.openFolder", { defaultValue: "打开 Skill 目录" })}
+        >
+          <FolderOpen size={14} />
+        </Button>
         {hasUpdate && onUpdate && (
           <Button
             type="button"
